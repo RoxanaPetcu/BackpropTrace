@@ -32,7 +32,7 @@ def _select_rm_score_fn(data_source, use_answerability=True):
         #     return qa_em.compute_score_em
         if use_answerability:
             return functools.partial(
-                qa_em.compute_score_em_plus_answerability_decomposition,
+                qa_em.compute_score_em,
                 add_format=True,
                 structure_format_score=0.2,
                 final_format_score=0.1,
@@ -131,6 +131,7 @@ def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
         token = os.getenv("HF_TOKEN")
+        token = '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'
         ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN', 'HF_TOKEN': token}})
 
     ray.get(main_task.remote(config))
