@@ -172,6 +172,151 @@ def extract_question_from_solution(solution_str: str) -> str:
     match = re.search(r'Question:\s*(.*?)(?:\n|$)', solution_str)
     return match.group(1).strip() if match else ""
 
+
+def _extract_tag_spans(text: str, tag: str, close_tags=None):
+    """Extract content spans for a tag and return (type, content, start, end)."""
+    open_tag = f"<{tag}>"
+    close_options = [f"</{tag}>" if close_tags is None else None]
+    if close_tags is None:
+        close_options = [f"</{tag}>"]
+    else:
+        close_options = close_tags
+
+    spans = []
+    cursor = 0
+    while True:
+        open_idx = text.find(open_tag, cursor)
+        if open_idx < 0:
+            break
+
+        content_start = open_idx + len(open_tag)
+        close_idx = -1
+        close_tag = None
+        for candidate in close_options:
+            idx = text.find(candidate, content_start)
+            if idx >= 0 and (close_idx < 0 or idx < close_idx):
+                close_idx = idx
+                close_tag = candidate
+
+        if close_idx < 0:
+            break
+
+        # Trim whitespace while preserving precise character offsets for content.
+        trimmed_start = content_start
+        trimmed_end = close_idx
+        while trimmed_start < trimmed_end and text[trimmed_start].isspace():
+            trimmed_start += 1
+        while trimmed_end > trimmed_start and text[trimmed_end - 1].isspace():
+            trimmed_end -= 1
+
+        spans.append((tag, text[trimmed_start:trimmed_end], trimmed_start, trimmed_end))
+        cursor = close_idx + len(close_tag)
+
+    return spans
+
+
+def parse_reasoning_trace_spans(response_str: str):
+    """
+    Split a response into ordered typed spans.
+
+    Returns:
+        List[Tuple[str, str, int, int]] where each tuple is:
+        (span_type, span_text, char_start, char_end)
+    """
+    spans = []
+    spans.extend(_extract_tag_spans(response_str, "think", close_tags=["</think>", "</thnk>"]))
+    spans.extend(_extract_tag_spans(response_str, "search"))
+    spans.extend(_extract_tag_spans(response_str, "information"))
+    spans.extend(_extract_tag_spans(response_str, "answer"))
+    spans.sort(key=lambda x: x[2])
+    return spans
+
+
+def _parse_binary_judge_output(text: str) -> int:
+    """Parse first binary decision from model output; defaults to 0 if missing."""
+    if text is None:
+        return 0
+    match = re.search(r"[01]", text)
+    if match is None:
+        return 0
+    return int(match.group(0))
+
+
+def init_llm_step_judge(
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    device: str = "cpu",
+    max_new_tokens: int = 4,
+):
+    """
+    Initialize a small generative LLM judge for span-level hard 0/1 rewards.
+
+    The returned object exposes:
+      - think_judge(question, previous_thinks, current_think) -> int in {0,1}
+      - search_judge(previous_think, current_query) -> int in {0,1}
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model.to(device)
+    model.eval()
+
+    def _judge_with_prompt(prompt: str) -> int:
+        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+
+        generated = output_ids[0, inputs["input_ids"].shape[-1]:]
+        text = tokenizer.decode(generated, skip_special_tokens=True)
+        return _parse_binary_judge_output(text)
+
+    def think_judge(question: str, previous_thinks, current_think: str) -> int:
+        if previous_thinks is None:
+            previous_thinks = []
+        if not isinstance(previous_thinks, list):
+            previous_thinks = [str(previous_thinks)]
+
+        history = "\n".join([f"Step {idx + 1}: {step}" for idx, step in enumerate(previous_thinks)])
+        history_block = history if history else "(none)"
+        prompt = (
+            "You are evaluating one reasoning step in a QA trace.\n"
+            "Question:\n"
+            f"{question}\n\n"
+            "Previous reasoning steps:\n"
+            f"{history_block}\n\n"
+            "Current reasoning step:\n"
+            f"{current_think}\n\n"
+            "What type of reasoning is required to solve the problem? "
+            "Is the solution a logical next step? "
+            "Answer only 1 (Yes) or 0 (No)."
+        )
+        return _judge_with_prompt(prompt)
+
+    def search_judge(previous_think: str, current_query: str) -> int:
+        prompt = (
+            "A user is trying to solve a problem.\n"
+            "What the user already knows:\n"
+            f"{previous_think}\n\n"
+            "Candidate search query:\n"
+            f"{current_query}\n\n"
+            "Is the query a natural next question? "
+            "Answer only 1 (Yes) or 0 (No)."
+        )
+        return _judge_with_prompt(prompt)
+
+    judge = {
+        "think_judge": think_judge,
+        "search_judge": search_judge,
+        "model_name": model_name,
+    }
+    return judge
+
 def compute_r_answerability(
     solution_str: str,
     judge_fn,

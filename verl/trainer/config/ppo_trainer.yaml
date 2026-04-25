@@ -162,6 +162,10 @@ algorithm:
   state_masking:
     start_state_marker: "<information>"
     end_state_marker: "</information>"
+  # Experiment 2: phase warm-up (think-only -> search-only -> all)
+  warm_up_phases: false
+  phase_threshold: 0.6   # EMA of active-phase judge score to trigger transition
+  phase_ema_decay: 0.9   # EMA decay factor (per batch)
 
 trainer:
   total_epochs: 30

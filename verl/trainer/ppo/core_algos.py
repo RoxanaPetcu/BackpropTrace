@@ -155,6 +155,77 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
     return scores, scores
 
 
+def compute_grpo_spanwise_lm_advantage(token_level_rewards: torch.Tensor,
+                                       span_type_mask: torch.Tensor,
+                                       eos_mask: torch.Tensor,
+                                       index: torch.Tensor,
+                                       epsilon: float = 1e-6):
+    """
+    Compute GRPO-style normalized advantages with per-type statistics.
+
+    Span types:
+      - 1: think
+      - 2: search
+      - 3: answer
+      - 0: information/ignored
+
+    For each prompt group (index) and each span type, we compute normalization
+    stats over span rewards (contiguous spans), then assign the normalized value
+    to all tokens in that span.
+    """
+    with torch.no_grad():
+        bsz, response_length = token_level_rewards.shape
+        advantages = torch.zeros_like(token_level_rewards)
+
+        # Keep tuples as: (sample_i, start, end, uid, span_type, raw_score)
+        segments = []
+        grouped_scores = defaultdict(list)
+
+        for i in range(bsz):
+            uid = index[i]
+            valid_mask = eos_mask[i].bool()
+            types_i = span_type_mask[i]
+
+            for span_type in (1, 2, 3):
+                tmask = valid_mask & (types_i == span_type)
+
+                j = 0
+                while j < response_length:
+                    if not tmask[j]:
+                        j += 1
+                        continue
+
+                    start = j
+                    while j < response_length and tmask[j]:
+                        j += 1
+                    end = j
+
+                    # Rewards are constant within a span by construction,
+                    # but mean keeps the code robust.
+                    raw_score = token_level_rewards[i, start:end].mean().item()
+                    key = (uid, span_type)
+                    grouped_scores[key].append(raw_score)
+                    segments.append((i, start, end, uid, span_type, raw_score))
+
+        grouped_stats = {}
+        for key, values in grouped_scores.items():
+            if len(values) <= 1:
+                grouped_stats[key] = (0.0, 1.0)
+            else:
+                values_t = torch.tensor(values, dtype=torch.float32)
+                mean_v = values_t.mean().item()
+                std_v = values_t.std(unbiased=False).item()
+                grouped_stats[key] = (mean_v, std_v)
+
+        for i, start, end, uid, span_type, raw_score in segments:
+            mean_v, std_v = grouped_stats[(uid, span_type)]
+            normed = (raw_score - mean_v) / (std_v + epsilon)
+            advantages[i, start:end] = normed
+
+        advantages = advantages * eos_mask
+    return advantages, advantages
+
+
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     kl = old_log_prob - ref_log_prob
     return token_level_scores - kl * kl_ratio

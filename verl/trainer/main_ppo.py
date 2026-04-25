@@ -122,6 +122,219 @@ class RewardManager():
         return reward_tensor
 
 
+class SpanwiseLMRewardManager():
+    """Reward manager with per-span rewards for think/search/answer."""
+
+    def __init__(self,
+                 tokenizer,
+                 step_judge,
+                 num_examine=0,
+                 structure_token_reward=0.02,
+                 valid_format_bonus=0.05,
+                 warm_up_phases=False,
+                 phase_threshold=0.6,
+                 phase_ema_decay=0.9) -> None:
+        self.tokenizer = tokenizer
+        self.step_judge = step_judge
+        self.num_examine = num_examine
+        self.structure_token_reward = structure_token_reward
+        self.valid_format_bonus = valid_format_bonus
+        self.warm_up_phases = warm_up_phases
+        self.phase_threshold = phase_threshold
+        self.phase_ema_decay = phase_ema_decay
+        # Phase state: 1=think-only, 2=search-only, 3=all
+        self._current_phase = 1
+        self._phase_ema = None
+
+    @staticmethod
+    def _char_span_to_token_indices(offsets, char_start, char_end, token_cap):
+        token_indices = []
+        n = min(len(offsets), token_cap)
+        for tok_idx in range(n):
+            tok_start, tok_end = offsets[tok_idx]
+            if tok_end <= tok_start:
+                continue
+            if tok_end <= char_start:
+                continue
+            if tok_start >= char_end:
+                continue
+            token_indices.append(tok_idx)
+        return token_indices
+
+    @staticmethod
+    def _collect_structural_tag_token_indices(response_str, offsets, token_cap):
+        """Collect token indices for structural tags that should receive format reward."""
+        tag2type = {
+            "think": 1,
+            "search": 2,
+            "answer": 3,
+        }
+        tagged = []
+        tag_pattern = r"</?(think|search|information|answer)>"
+        for m in re.finditer(tag_pattern, response_str):
+            tag_name = m.group(1)
+            # Keep information fully masked.
+            if tag_name == "information":
+                continue
+            type_id = tag2type.get(tag_name)
+            if type_id is None:
+                continue
+            tok_indices = SpanwiseLMRewardManager._char_span_to_token_indices(
+                offsets=offsets,
+                char_start=m.start(),
+                char_end=m.end(),
+                token_cap=token_cap,
+            )
+            for tok_idx in tok_indices:
+                tagged.append((tok_idx, type_id))
+        return tagged
+
+    def __call__(self, data: DataProto):
+        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        span_type_mask = torch.zeros_like(data.batch['responses'], dtype=torch.long)
+        judge_think_avg = torch.zeros((len(data),), dtype=torch.float32, device=reward_tensor.device)
+        judge_search_avg = torch.zeros((len(data),), dtype=torch.float32, device=reward_tensor.device)
+
+        already_printed = 0
+        # Collect across all samples for phase EMA update.
+        all_think_scores = []
+        all_search_scores = []
+
+        for i in range(len(data)):
+            data_item = data[i]
+
+            prompt_ids = data_item.batch['prompts']
+            prompt_length = prompt_ids.shape[-1]
+            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = data_item.batch['responses']
+            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            sequence_ids = torch.cat((valid_prompt_ids, valid_response_ids))
+            sequence_str = self.tokenizer.decode(sequence_ids)
+            response_str = self.tokenizer.decode(valid_response_ids)
+
+            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+            question = qa_em.extract_question_from_solution(sequence_str)
+            spans = qa_em.parse_reasoning_trace_spans(response_str)
+            valid_response_length = int(valid_response_length)
+
+            answer_reward = qa_em.compute_score_em(
+                solution_str=sequence_str,
+                ground_truth=ground_truth,
+                add_format=False,
+            )
+
+            try:
+                tokenized_resp = self.tokenizer(
+                    response_str,
+                    add_special_tokens=False,
+                    return_offsets_mapping=True,
+                )
+                offsets = tokenized_resp.get('offset_mapping', [])
+            except Exception:
+                offsets = []
+
+            previous_thinks = []
+            last_think = ""
+            think_scores = []
+            search_scores = []
+
+            for span_type, span_text, char_start, char_end in spans:
+                if span_type == 'think':
+                    judge_score = float(self.step_judge['think_judge'](question, previous_thinks, span_text))
+                    think_scores.append(judge_score)
+                    type_id = 1
+                    previous_thinks.append(span_text)
+                    last_think = span_text
+                    # Gate: think content only active in phase 1 or 3
+                    raw_reward = judge_score if (not self.warm_up_phases or self._current_phase != 2) else 0.0
+                elif span_type == 'search':
+                    judge_score = float(self.step_judge['search_judge'](last_think, span_text))
+                    search_scores.append(judge_score)
+                    type_id = 2
+                    # Gate: search content only active in phase 2 or 3
+                    raw_reward = judge_score if (not self.warm_up_phases or self._current_phase != 1) else 0.0
+                elif span_type == 'answer':
+                    type_id = 3
+                    # Gate: answer content only active in phase 3
+                    raw_reward = float(answer_reward) if (not self.warm_up_phases or self._current_phase == 3) else 0.0
+                else:
+                    raw_reward = 0.0
+                    type_id = 0
+
+                tok_indices = self._char_span_to_token_indices(
+                    offsets=offsets,
+                    char_start=char_start,
+                    char_end=char_end,
+                    token_cap=valid_response_length,
+                )
+
+                for tok_idx in tok_indices:
+                    reward_tensor[i, tok_idx] = raw_reward
+                    span_type_mask[i, tok_idx] = type_id
+
+            # Add a small token-local format reward to structural tags.
+            tagged_tokens = self._collect_structural_tag_token_indices(
+                response_str=response_str,
+                offsets=offsets,
+                token_cap=valid_response_length,
+            )
+            for tok_idx, type_id in tagged_tokens:
+                reward_tensor[i, tok_idx] += self.structure_token_reward
+                if span_type_mask[i, tok_idx] == 0:
+                    span_type_mask[i, tok_idx] = type_id
+
+            # Add global format bonus over learnable reasoning tokens.
+            is_valid_format, _ = qa_em.is_valid_sequence(sequence_str)
+            if is_valid_format:
+                learnable_mask = (span_type_mask[i] == 1) | (span_type_mask[i] == 2) | (span_type_mask[i] == 3)
+                reward_tensor[i, learnable_mask] += self.valid_format_bonus
+
+            if think_scores:
+                judge_think_avg[i] = float(np.mean(think_scores))
+            if search_scores:
+                judge_search_avg[i] = float(np.mean(search_scores))
+            all_think_scores.extend(think_scores)
+            all_search_scores.extend(search_scores)
+
+            if already_printed < self.num_examine:
+                already_printed += 1
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                sample_id = f"SPAN_R{rank}_I{i}"
+                print(f"[{sample_id}] ========== REASONING TRACE ==========")
+                print(f"[{sample_id}] {sequence_str}")
+                print(f"[{sample_id}] ========== END TRACE ==========")
+
+        data.batch['span_type_mask'] = span_type_mask
+        data.batch['judge_think_avg'] = judge_think_avg
+        data.batch['judge_search_avg'] = judge_search_avg
+
+        # Phase warm-up: update EMA and check for phase transition.
+        if self.warm_up_phases and self._current_phase < 3:
+            active_scores = all_think_scores if self._current_phase == 1 else all_search_scores
+            if active_scores:
+                batch_score = float(np.mean(active_scores))
+                if self._phase_ema is None:
+                    self._phase_ema = batch_score
+                else:
+                    self._phase_ema = (self.phase_ema_decay * self._phase_ema
+                                       + (1.0 - self.phase_ema_decay) * batch_score)
+                if self._phase_ema >= self.phase_threshold:
+                    old_phase = self._current_phase
+                    self._current_phase += 1
+                    self._phase_ema = None  # reset EMA for new phase
+                    print(f"[WarmUpPhases] Phase transition {old_phase} -> {self._current_phase} "
+                          f"(EMA crossed threshold {self.phase_threshold:.2f})")
+
+        data.batch['current_phase'] = torch.full(
+            (len(data),), self._current_phase, dtype=torch.long, device=reward_tensor.device
+        )
+        return reward_tensor
+
+
 import ray
 import hydra
 
@@ -221,7 +434,22 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, use_answerability=True)
+    if config.algorithm.adv_estimator == 'grpo_spanwise_lm':
+        step_judge = qa_em.init_llm_step_judge(
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            device="cpu",
+            max_new_tokens=4,
+        )
+        reward_fn = SpanwiseLMRewardManager(
+            tokenizer=tokenizer,
+            step_judge=step_judge,
+            num_examine=0,
+            warm_up_phases=bool(getattr(config.algorithm, 'warm_up_phases', False)),
+            phase_threshold=float(getattr(config.algorithm, 'phase_threshold', 0.6)),
+            phase_ema_decay=float(getattr(config.algorithm, 'phase_ema_decay', 0.9)),
+        )
+    else:
+        reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, use_answerability=True)
 
     # Note that we always use function-based RM for validation
     val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1, use_answerability=False)

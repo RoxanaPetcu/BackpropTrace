@@ -203,6 +203,7 @@ export BASE_MODEL='Qwen/Qwen2.5-3B'
 ### MODIFY HERE
 # model="llama3.2-3b"
 model="Qwen-Qwen2.5-3B" 
+adv_estimator="grpo_spanwise_lm"
 prompt_decomposition="true"
 r_answerability="true"
 alpha=0.8
@@ -210,7 +211,7 @@ beta=0.2
 lr="1e6"
 ### MODIFY HERE
 
-EXPERIMENT_NAME="SearchR1-Subsample-nq+hotpotqa-grpo-format-${model}"
+EXPERIMENT_NAME="Backprop-SubSample-Experiment1-nq+hotpotqa-format-${model}"
 
 # Standard string comparison
 if [ "$prompt_decomposition" == "true" ]; then
@@ -225,6 +226,7 @@ if [ "$prompt_decomposition" == "true" ]; then
 else
   max_obs_length=500
 fi
+
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME}-lr${lr}"
 
@@ -258,7 +260,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.max_start_length=2048 \
     data.max_obs_length=$max_obs_length \
     data.shuffle_train_dataloader=True \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=$adv_estimator \
     actor_rollout_ref.model.path=$BASE_MODEL \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.model.use_remove_padding=True \

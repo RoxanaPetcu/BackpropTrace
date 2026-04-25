@@ -149,6 +149,22 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                                                                         index=index)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == 'grpo_spanwise_lm':
+        token_level_rewards = data.batch['token_level_rewards']
+        span_type_mask = data.batch['span_type_mask']
+        index = data.non_tensor_batch['uid']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        advantages, returns = core_algos.compute_grpo_spanwise_lm_advantage(
+            token_level_rewards=token_level_rewards,
+            span_type_mask=span_type_mask,
+            eos_mask=response_mask,
+            index=index,
+        )
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -274,6 +290,13 @@ def compute_data_metrics(batch, use_critic=True):
         metrics['env/ratio_of_valid_action'] = float((np.array(batch.meta_info['valid_action_stats'], dtype=np.int16) / np.array(batch.meta_info['turns_stats'], dtype=np.int16)).mean())
     if 'valid_search_stats' in batch.meta_info:
         metrics['env/number_of_valid_search'] = float(np.array(batch.meta_info['valid_search_stats'], dtype=np.int16).mean())
+
+    if 'judge_think_avg' in batch.batch:
+        metrics['reward/judge_think/mean'] = torch.mean(batch.batch['judge_think_avg']).detach().item()
+    if 'judge_search_avg' in batch.batch:
+        metrics['reward/judge_search/mean'] = torch.mean(batch.batch['judge_search_avg']).detach().item()
+    if 'current_phase' in batch.batch:
+        metrics['reward/warm_up_phase'] = int(batch.batch['current_phase'][0].item())
 
 
     return metrics
@@ -570,7 +593,7 @@ class RayPPOTrainer(object):
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
             
-        elif self.config.algorithm.adv_estimator == 'grpo':
+        elif self.config.algorithm.adv_estimator in ('grpo', 'grpo_spanwise_lm'):
             self.use_critic = False
         else:
             raise NotImplementedError
