@@ -295,8 +295,6 @@ def compute_data_metrics(batch, use_critic=True):
         metrics['reward/judge_think/mean'] = torch.mean(batch.batch['judge_think_avg']).detach().item()
     if 'judge_search_avg' in batch.batch:
         metrics['reward/judge_search/mean'] = torch.mean(batch.batch['judge_search_avg']).detach().item()
-    if 'current_phase' in batch.batch:
-        metrics['reward/warm_up_phase'] = int(batch.batch['current_phase'][0].item())
 
 
     return metrics

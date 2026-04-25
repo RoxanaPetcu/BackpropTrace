@@ -130,21 +130,12 @@ class SpanwiseLMRewardManager():
                  step_judge,
                  num_examine=0,
                  structure_token_reward=0.02,
-                 valid_format_bonus=0.05,
-                 warm_up_phases=False,
-                 phase_threshold=0.6,
-                 phase_ema_decay=0.9) -> None:
+                 valid_format_bonus=0.05) -> None:
         self.tokenizer = tokenizer
         self.step_judge = step_judge
         self.num_examine = num_examine
         self.structure_token_reward = structure_token_reward
         self.valid_format_bonus = valid_format_bonus
-        self.warm_up_phases = warm_up_phases
-        self.phase_threshold = phase_threshold
-        self.phase_ema_decay = phase_ema_decay
-        # Phase state: 1=think-only, 2=search-only, 3=all
-        self._current_phase = 1
-        self._phase_ema = None
 
     @staticmethod
     def _char_span_to_token_indices(offsets, char_start, char_end, token_cap):
@@ -196,20 +187,17 @@ class SpanwiseLMRewardManager():
         judge_search_avg = torch.zeros((len(data),), dtype=torch.float32, device=reward_tensor.device)
 
         already_printed = 0
-        # Collect across all samples for phase EMA update.
-        all_think_scores = []
-        all_search_scores = []
 
         for i in range(len(data)):
             data_item = data[i]
 
             prompt_ids = data_item.batch['prompts']
             prompt_length = prompt_ids.shape[-1]
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+            valid_prompt_length = int(data_item.batch['attention_mask'][:prompt_length].sum())
             valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
             response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+            valid_response_length = int(data_item.batch['attention_mask'][prompt_length:].sum())
             valid_response_ids = response_ids[:valid_response_length]
 
             sequence_ids = torch.cat((valid_prompt_ids, valid_response_ids))
@@ -219,7 +207,6 @@ class SpanwiseLMRewardManager():
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
             question = qa_em.extract_question_from_solution(sequence_str)
             spans = qa_em.parse_reasoning_trace_spans(response_str)
-            valid_response_length = int(valid_response_length)
 
             answer_reward = qa_em.compute_score_em(
                 solution_str=sequence_str,
@@ -244,23 +231,18 @@ class SpanwiseLMRewardManager():
 
             for span_type, span_text, char_start, char_end in spans:
                 if span_type == 'think':
-                    judge_score = float(self.step_judge['think_judge'](question, previous_thinks, span_text))
-                    think_scores.append(judge_score)
+                    raw_reward = float(self.step_judge['think_judge'](question, previous_thinks, span_text))
+                    think_scores.append(raw_reward)
                     type_id = 1
                     previous_thinks.append(span_text)
                     last_think = span_text
-                    # Gate: think content only active in phase 1 or 3
-                    raw_reward = judge_score if (not self.warm_up_phases or self._current_phase != 2) else 0.0
                 elif span_type == 'search':
-                    judge_score = float(self.step_judge['search_judge'](last_think, span_text))
-                    search_scores.append(judge_score)
+                    raw_reward = float(self.step_judge['search_judge'](last_think, span_text))
+                    search_scores.append(raw_reward)
                     type_id = 2
-                    # Gate: search content only active in phase 2 or 3
-                    raw_reward = judge_score if (not self.warm_up_phases or self._current_phase != 1) else 0.0
                 elif span_type == 'answer':
+                    raw_reward = float(answer_reward)
                     type_id = 3
-                    # Gate: answer content only active in phase 3
-                    raw_reward = float(answer_reward) if (not self.warm_up_phases or self._current_phase == 3) else 0.0
                 else:
                     raw_reward = 0.0
                     type_id = 0
@@ -297,8 +279,6 @@ class SpanwiseLMRewardManager():
                 judge_think_avg[i] = float(np.mean(think_scores))
             if search_scores:
                 judge_search_avg[i] = float(np.mean(search_scores))
-            all_think_scores.extend(think_scores)
-            all_search_scores.extend(search_scores)
 
             if already_printed < self.num_examine:
                 already_printed += 1
@@ -311,27 +291,6 @@ class SpanwiseLMRewardManager():
         data.batch['span_type_mask'] = span_type_mask
         data.batch['judge_think_avg'] = judge_think_avg
         data.batch['judge_search_avg'] = judge_search_avg
-
-        # Phase warm-up: update EMA and check for phase transition.
-        if self.warm_up_phases and self._current_phase < 3:
-            active_scores = all_think_scores if self._current_phase == 1 else all_search_scores
-            if active_scores:
-                batch_score = float(np.mean(active_scores))
-                if self._phase_ema is None:
-                    self._phase_ema = batch_score
-                else:
-                    self._phase_ema = (self.phase_ema_decay * self._phase_ema
-                                       + (1.0 - self.phase_ema_decay) * batch_score)
-                if self._phase_ema >= self.phase_threshold:
-                    old_phase = self._current_phase
-                    self._current_phase += 1
-                    self._phase_ema = None  # reset EMA for new phase
-                    print(f"[WarmUpPhases] Phase transition {old_phase} -> {self._current_phase} "
-                          f"(EMA crossed threshold {self.phase_threshold:.2f})")
-
-        data.batch['current_phase'] = torch.full(
-            (len(data),), self._current_phase, dtype=torch.long, device=reward_tensor.device
-        )
         return reward_tensor
 
 
@@ -440,14 +399,7 @@ def main_task(config):
             device="cpu",
             max_new_tokens=4,
         )
-        reward_fn = SpanwiseLMRewardManager(
-            tokenizer=tokenizer,
-            step_judge=step_judge,
-            num_examine=0,
-            warm_up_phases=bool(getattr(config.algorithm, 'warm_up_phases', False)),
-            phase_threshold=float(getattr(config.algorithm, 'phase_threshold', 0.6)),
-            phase_ema_decay=float(getattr(config.algorithm, 'phase_ema_decay', 0.9)),
-        )
+        reward_fn = SpanwiseLMRewardManager(tokenizer=tokenizer, step_judge=step_judge, num_examine=0)
     else:
         reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, use_answerability=True)
 
