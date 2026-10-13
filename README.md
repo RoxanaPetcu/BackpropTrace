@@ -1,17 +1,17 @@
-# SubSearch: Intermediate Rewards for Unsupervised Guided Reasoning in Complex Retrieval
+# Local Proxies, Global Failures: Does Better Local Reasoning Improve Generation, or Do Models Strategize Differently?
 
-SubSearch is a reinforcement learning (RL) framework designed for training hierarchical reasoning-and-searching LLMs. While standard models often struggle with complex, multi-hop information needs, SubSearch enables language models to autonomously decompose a query into a verifiable tree of sub-queries.
+This repository contains the code for a multi-objective optimization study on multi-hop QA reasoning.
 
-Built upon veRL and extending the foundational ideas of Search-R1 and DeepSeek-R1, SubSearch introduces a dual-level reward system. It moves beyond simple outcome-based rewards by integrating intrinsic process sensors: Splittability (rewarding logical decomposition at the query level) and Answerability (rewarding document sufficiency at the sub-query level). This creates a robust, open-source RL training pipeline for building agents capable of deep, multi-step research.
+We decompose the reasoning trace of a search agent into three stages: step-wise entailment, search query formulation, and answer generation, and attach a targeted **proxy reward** to each one, forming a cascading dependency chain. Rewards are assigned at the token level, so credit is attributed to the specific trace segment that produced it, rather than aggregated into a single scalar.
 
-We support various RL methods (e.g., PPO, GRPO), diverse base models (e.g., Llama 3.2, Qwen 2.5), and flexible retrieval backends, ranging from local vector stores to live web search.
+We train under two regimes: **simultaneous backpropagation** of all objectives, and **phased warm-up**, in which each component is optimized in isolation before the next is introduced.
 
 ## Installation
 
-### Search-r1 environment
+### BackpropTrace environment
 ```bash
-conda create -n subsearch_rl python=3.9
-conda activate subsearch_rl
+conda create -n BackpropTrace python=3.9
+conda activate BackpropTrace
 
 pip install torch==2.4.0 --index-url [https://download.pytorch.org/whl/cu121](https://download.pytorch.org/whl/cu121)
 pip install vllm==0.6.3 flash-attn --no-build-isolation
@@ -66,6 +66,6 @@ bash run_retriever.sh
 export RETRIEVER_IP_PATH=/path/to/save/IP/file
 export DATA_PATH=/path/to/data
 export SAVE_DIR_BASE=/path//to/checkpoints
-conda activate subsearch_rl
+conda activate BackpropTrace
 bash train_grpo.sh
 ```
