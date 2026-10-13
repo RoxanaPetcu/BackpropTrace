@@ -9,7 +9,7 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate searchr1
 
 # 2. Automatically get the Retriever IP
-IP_FILE="/scratch-shared/rpetcu/current_retriever_ip_searchr1.txt"
+IP_FILE="/<path>/current_retriever_ip_searchr1.txt"
 
 if [ -f "$IP_FILE" ]; then
     RETRIEVER_IP=$(cat "$IP_FILE")
@@ -19,8 +19,8 @@ else
     exit 1
 fi
 
-export HF_HOME="/scratch-shared/rpetcu/hf_cache"
-export TRITON_CACHE_DIR="/scratch-shared/rpetcu/triton_cache"
+export HF_HOME="/<path>/hf_cache"
+export TRITON_CACHE_DIR="/<path>/triton_cache"
 export PYTHONUNBUFFERED=1
 
 # Ensure the directories exist on scratch
@@ -64,10 +64,10 @@ fi
 echo "Using batch sizes: train=${train_batch_size}, val=${val_batch_size}"
 
 
-# export DATA_DIR='/home/rpetcu/projects/Search-R1/data/nq_search'
-# export DATA_DIR='/home/rpetcu/projects/Search-R1/data/nq_search_decomposed'
-# export DATA_DIR='/home/rpetcu/projects/Search-R1/data/nq_search_decomposed_val'
-export DATA_DIR="/home/rpetcu/projects/Search-R1/data/${eval_dataset}_search_rsearch"
+# export DATA_DIR='/<path>/projects/Search-R1/data/nq_search'
+# export DATA_DIR='/<path>/projects/Search-R1/data/nq_search_decomposed'
+# export DATA_DIR='/<path>/projects/Search-R1/data/nq_search_decomposed_val'
+export DATA_DIR="/<path>/projects/Search-R1/data/${eval_dataset}_search_rsearch"
 
 # export BASE_MODEL='meta-llama/Llama-3.2-3B'
 export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
@@ -100,7 +100,7 @@ echo "Saving to WandB as: $EXPERIMENT_NAME"
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
-export SAVE_DIR="/scratch-shared/rpetcu/verl_checkpoints/$EXPERIMENT_NAME"
+export SAVE_DIR="/<path>/verl_checkpoints/$EXPERIMENT_NAME"
 
 # 4. Test on Val (because Search-R1 validates on test)
 # actor_rollout_ref.model.path=$BASE_MODEL
@@ -115,7 +115,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.max_obs_length=500 \
     data.shuffle_train_dataloader=True \
     algorithm.adv_estimator=grpo \
-    actor_rollout_ref.model.path="/scratch-shared/rpetcu/verl_checkpoints/R-Search-3b-grpo-nq-hotpotqa/actor/global_step_195" \
+    actor_rollout_ref.model.path="/<path>/verl_checkpoints/R-Search-3b-grpo-nq-hotpotqa/actor/global_step_195" \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.optim.lr=5e-7 \

@@ -6,5 +6,5 @@
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=16
 
-# This runs your existing training script on a single GPU node
+# This runs your existing training script on a single GPU node, was 12h
 bash train_grpo.sh

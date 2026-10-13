@@ -2,10 +2,10 @@ import pandas as pd
 import os
 
 # Original directory
-source_dir = "/home/rpetcu/projects/BackpropTrace/data/nq_hotpotqa_search_decomposed"
+source_dir = "/<path>/projects/BackpropTrace/data/nq_hotpotqa_search_decomposed"
 
 # Parallel directory name
-target_dir = "/home/rpetcu/projects/BackpropTrace/data/subset_nq_hotpotqa_search_decomposed"
+target_dir = "/<path>/projects/BackpropTrace/data/subset_nq_hotpotqa_search_decomposed"
 
 # Ensure the new directory exists
 os.makedirs(target_dir, exist_ok=True)

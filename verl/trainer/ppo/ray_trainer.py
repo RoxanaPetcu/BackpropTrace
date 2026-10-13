@@ -295,6 +295,12 @@ def compute_data_metrics(batch, use_critic=True):
         metrics['reward/judge_think/mean'] = torch.mean(batch.batch['judge_think_avg']).detach().item()
     if 'judge_search_avg' in batch.batch:
         metrics['reward/judge_search/mean'] = torch.mean(batch.batch['judge_search_avg']).detach().item()
+    if 'answer_em_avg' in batch.batch:
+        metrics['reward/answer_em/mean'] = torch.mean(batch.batch['answer_em_avg']).detach().item()
+    if 'has_answer_per_sample' in batch.batch:
+        metrics['reward/has_answer_ratio'] = torch.mean(batch.batch['has_answer_per_sample']).detach().item()
+    if 'current_phase' in batch.batch:
+        metrics['reward/warm_up_phase'] = int(batch.batch['current_phase'][0].item())
 
 
     return metrics
@@ -820,11 +826,26 @@ class RayPPOTrainer(object):
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
+                        runtime_adv_estimator = self.config.algorithm.adv_estimator
+                        pre_warmup_steps = int(self.config.algorithm.get('pre_warmup_steps', 0))
+                        in_pre_warmup = (
+                            runtime_adv_estimator == 'grpo_spanwise_lm' and
+                            pre_warmup_steps > 0 and
+                            self.global_steps <= pre_warmup_steps
+                        )
+                        if in_pre_warmup:
+                            runtime_adv_estimator = 'grpo'
+                        elif runtime_adv_estimator == 'grpo_spanwise_lm' and 'current_phase' in batch.batch:
+                            current_phase = int(batch.batch['current_phase'][0].item())
+                            if current_phase == 3:
+                                runtime_adv_estimator = 'grpo'
+
                         batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
+                                                      adv_estimator=runtime_adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        metrics['reward/pre_warmup_active'] = 1 if in_pre_warmup else 0
 
                     # update critic
                     if self.use_critic:
@@ -877,13 +898,36 @@ class RayPPOTrainer(object):
         """Create loss mask for state tokens."""
         response_length = batch.batch['responses'].shape[-1]
         response_mask = batch.batch['attention_mask'][:, -response_length:]
-        
-        loss_mask = batch.batch['info_mask'][:, -response_length:]
+
+        info_mask = batch.batch['info_mask'][:, -response_length:]
+        loss_mask = info_mask
+        phase_loss_mask = None
+        if 'phase_loss_mask' in batch.batch:
+            phase_loss_mask = batch.batch['phase_loss_mask'][:, -response_length:]
+            loss_mask = loss_mask * phase_loss_mask
         batch.batch['loss_mask'] = loss_mask
 
+        total_tokens = response_mask.sum().item()
+        trainable_tokens = loss_mask.sum().item()
+        masked_tokens = total_tokens - trainable_tokens
+        info_masked_tokens = total_tokens - info_mask.sum().item()
+
+        if phase_loss_mask is not None:
+            phase_masked_tokens = total_tokens - phase_loss_mask.sum().item()
+        else:
+            phase_masked_tokens = 0.0
+
+        denom = max(float(total_tokens), 1.0)
+
         metrics.update({
-            'state_tokens/total': loss_mask.sum().item(),
-            'state_tokens/coverage': (loss_mask.sum() / response_mask.sum()).item(),
+            'state_tokens/total': trainable_tokens,
+            'state_tokens/coverage': trainable_tokens / denom,
+            'state_tokens/masked_total': masked_tokens,
+            'state_tokens/masked_total_ratio': masked_tokens / denom,
+            'state_tokens/masked_info': info_masked_tokens,
+            'state_tokens/masked_info_ratio': info_masked_tokens / denom,
+            'state_tokens/masked_phase': phase_masked_tokens,
+            'state_tokens/masked_phase_ratio': phase_masked_tokens / denom,
         })
         
         return batch, metrics

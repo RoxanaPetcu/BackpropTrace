@@ -154,6 +154,15 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  pre_warmup_steps: 0
+  format_warmup_steps: 0
+  phase_steps: 50
+  phase_decline_patience: 3
+  phase_decline_min_delta: 0.0
+  structure_token_reward: 0.0
+  valid_format_bonus: 0.0
+  think_judge_mode: nli
+  reasoning_prompt_model: Qwen/Qwen2.5-0.5B-Instruct
   no_think_rl: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:

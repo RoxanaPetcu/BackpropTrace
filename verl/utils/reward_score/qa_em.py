@@ -17,9 +17,12 @@ import string
 import random
 import threading
 import math
+import numpy as np
 
 
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer, util, CrossEncoder
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 from .qa_em_format import (
     is_valid_sequence,
     extract_solution,
@@ -242,41 +245,25 @@ def _parse_binary_judge_output(text: str) -> int:
     return int(match.group(0))
 
 
-def init_llm_step_judge(
-    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
-    device: str = "cpu",
-    max_new_tokens: int = 4,
-):
+def _build_reasoning_prompt_think_judge(lm_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct", device: str = "cpu"):
     """
-    Initialize a small generative LLM judge for span-level hard 0/1 rewards.
-
-    The returned object exposes:
-      - think_judge(question, previous_thinks, current_think) -> int in {0,1}
-      - search_judge(previous_think, current_query) -> int in {0,1}
+    Returns a think_judge function that uses a small generative LLM with a
+    reasoning-aware prompt.  The judge accepts any valid reasoning style
+    (deduction, induction, proof by contradiction, elimination, etc.) and
+    returns 1.0 if the step makes meaningful progress, 0.0 otherwise.
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-    model.to(device)
+    tokenizer = AutoTokenizer.from_pretrained(lm_model_name)
+    model = AutoModelForCausalLM.from_pretrained(lm_model_name, torch_dtype=torch.float32)
     model.eval()
+    model.to(device)
 
-    def _judge_with_prompt(prompt: str) -> int:
-        inputs = tokenizer(prompt, return_tensors="pt")
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+    # Pre-tokenize the two answer tokens so we can compare log-probs directly
+    _tok_1 = tokenizer.encode("1", add_special_tokens=False)
+    _tok_0 = tokenizer.encode("0", add_special_tokens=False)
+    yes_id = _tok_1[0] if _tok_1 else None
+    no_id  = _tok_0[0] if _tok_0 else None
 
-        generated = output_ids[0, inputs["input_ids"].shape[-1]:]
-        text = tokenizer.decode(generated, skip_special_tokens=True)
-        return _parse_binary_judge_output(text)
-
-    def think_judge(question: str, previous_thinks, current_think: str) -> int:
+    def think_judge(question: str, previous_thinks, current_think: str) -> float:
         if previous_thinks is None:
             previous_thinks = []
         if not isinstance(previous_thinks, list):
@@ -284,31 +271,116 @@ def init_llm_step_judge(
 
         history = "\n".join([f"Step {idx + 1}: {step}" for idx, step in enumerate(previous_thinks)])
         history_block = history if history else "(none)"
-        prompt = (
-            "You are evaluating one reasoning step in a QA trace.\n"
-            "Question:\n"
-            f"{question}\n\n"
-            "Previous reasoning steps:\n"
-            f"{history_block}\n\n"
-            "Current reasoning step:\n"
-            f"{current_think}\n\n"
-            "What type of reasoning is required to solve the problem? "
-            "Is the solution a logical next step? "
-            "Answer only 1 (Yes) or 0 (No)."
-        )
-        return _judge_with_prompt(prompt)
 
-    def search_judge(previous_think: str, current_query: str) -> int:
         prompt = (
-            "A user is trying to solve a problem.\n"
-            "What the user already knows:\n"
-            f"{previous_think}\n\n"
-            "Candidate search query:\n"
-            f"{current_query}\n\n"
-            "Is the query a natural next question? "
-            "Answer only 1 (Yes) or 0 (No)."
+            "You are evaluating a single step in a multi-step reasoning chain.\n"
+            f"Question: {question}\n"
+            f"Prior reasoning steps:\n{history_block}\n"
+            f"Current reasoning step:\n{current_think}\n\n"
+            "Does this reasoning step make meaningful progress toward answering the question?\n"
+            "Valid reasoning includes: deduction, induction, proof by contradiction, "
+            "elimination of options, identifying relevant facts, or any other logically valid approach.\n"
+            "Answer with a single digit: 1 if yes, 0 if no."
         )
-        return _judge_with_prompt(prompt)
+        messages = [{"role": "user", "content": prompt}]
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(text, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        next_token_logits = outputs.logits[0, -1, :]  # (vocab_size,)
+        if yes_id is not None and no_id is not None:
+            log_probs = torch.log_softmax(next_token_logits, dim=-1)
+            p_yes = log_probs[yes_id].exp().item()
+            p_no  = log_probs[no_id].exp().item()
+            denom = p_yes + p_no + 1e-8
+            return float(p_yes / denom)
+        else:
+            # Fallback: decode top-1 token and look for '1'
+            top_id = next_token_logits.argmax().item()
+            tok = tokenizer.decode([top_id]).strip()
+            return 1.0 if tok.startswith("1") else 0.0
+
+    return think_judge
+
+
+def init_llm_step_judge(
+    model_name: str = "all-MiniLM-L6-v2",
+    nli_model_name: str = "cross-encoder/nli-deberta-v3-small",
+    device: str = "cpu",
+    max_new_tokens: int = 4,  # unused, kept for API compatibility
+    think_judge_mode: str = "nli",  # "nli" | "reasoning_prompt"
+    reasoning_prompt_model: str = "Qwen/Qwen2.5-0.5B-Instruct",
+):
+    """
+    Initialize span-level judges:
+      - think_judge: controlled by think_judge_mode
+          - "nli" (default): DeBERTa-v3-small NLI cross-encoder, soft entailment score
+          - "reasoning_prompt": small generative LLM with a reasoning-aware prompt;
+            accepts any valid reasoning style (deduction, induction, contradiction, etc.)
+      - search_judge: DeBERTa-v3-small cross-encoder, yes/no classifier.
+
+    The returned object exposes:
+      - think_judge(question, previous_thinks, current_think) -> float in [0, 1]
+      - search_judge(previous_think, current_query) -> float in [0, 1]
+    """
+    # NLI cross-encoder for think spans (used in "nli" mode and always for search_judge)
+    nli_model = CrossEncoder(nli_model_name, device=device)
+    # label order for nli-deberta-v3-small: contradiction=0, entailment=1, neutral=2
+    ENTAILMENT_IDX = 1
+
+    if think_judge_mode == "reasoning_prompt":
+        think_judge = _build_reasoning_prompt_think_judge(
+            lm_model_name=reasoning_prompt_model, device=device
+        )
+    else:
+        # Default NLI-based think judge
+        def think_judge(question: str, previous_thinks, current_think: str) -> float:
+            """Returns soft entailment probability in [0, 1]."""
+            if previous_thinks is None:
+                previous_thinks = []
+            if not isinstance(previous_thinks, list):
+                previous_thinks = [str(previous_thinks)]
+
+            history = "\n".join([f"Step {idx + 1}: {step}" for idx, step in enumerate(previous_thinks)])
+            history_block = history if history else "(none)"
+            premise = (
+                f"Someone is answering the question: \"{question}\". "
+                f"So far they have reasoned: {history_block}"
+            )
+            hypothesis = current_think
+            scores = nli_model.predict([(premise, hypothesis)])[0]  # shape (3,)
+            probs = torch.softmax(torch.tensor(scores), dim=-1)
+            # Penalize generic meta-commentary: subtract neutral probability so that
+            # trivially entailed statements ("The question asks about X, I need to search")
+            # score near 0, while specific grounded deductions (high entailment, low neutral)
+            # score near 1.
+            NEUTRAL_IDX = 2
+            return float(max(0.0, (probs[ENTAILMENT_IDX] - probs[NEUTRAL_IDX]).item()))
+
+    def search_judge(previous_think: str, current_query: str) -> float:
+        """Returns soft yes-probability in [0, 1] for next-action classification."""
+        premise = (
+            "Current reasoning step:\n"
+            f"{previous_think if previous_think else '(none)'}\n\n"
+            "Candidate search query:\n"
+            f"{current_query}"
+        )
+        yes_h = "Yes: this query is the natural next action implied by the reasoning step."
+        no_h = "No: this query is not the natural next action implied by the reasoning step."
+
+        yes_scores = nli_model.predict([(premise, yes_h)])[0]  # shape (3,)
+        no_scores = nli_model.predict([(premise, no_h)])[0]    # shape (3,)
+        yes_probs = torch.softmax(torch.tensor(yes_scores), dim=-1)
+        no_probs = torch.softmax(torch.tensor(no_scores), dim=-1)
+
+        # Binary classifier-style score using the model's entailment confidence for
+        # positive vs negative hypotheses.
+        p_yes = yes_probs[ENTAILMENT_IDX]
+        p_no = no_probs[ENTAILMENT_IDX]
+        denom = p_yes + p_no + 1e-8
+        return float((p_yes / denom).item())
 
     judge = {
         "think_judge": think_judge,

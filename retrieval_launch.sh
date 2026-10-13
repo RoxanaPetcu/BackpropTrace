@@ -28,10 +28,14 @@ conda activate retriever
 # Get the internal IP of this node
 export RETRIEVER_IP=$(hostname -I | awk '{for(i=1;i<=NF;i++) if($i !~ /^169\.254/) {print $i; exit}}')
 # Save it to scratch so the Trainer job can read it
-echo "$RETRIEVER_IP" > /scratch-shared/rpetcu/current_retriever_ip_backproptrace.txt
+echo "$RETRIEVER_IP" > /<path>/current_retriever_ip_backproptrace.txt
 echo "RETRIEVER IS RUNNING ON INTERNAL IP: $RETRIEVER_IP"
 
-file_path=/scratch-shared/rpetcu/data/subsearch
+export HF_HOME="/<path>/hf_cache"
+export HF_DATASETS_CACHE="/<path>/hf_cache/datasets"
+mkdir -p "$HF_DATASETS_CACHE"
+
+file_path=/<path>/data/subsearch
 index_file=$file_path/e5_Flat.index
 corpus_file=$file_path/wiki-18.jsonl
 retriever_name=e5

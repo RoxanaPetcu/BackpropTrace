@@ -1,1 +1,1 @@
-http://gcn134.local.snellius.surf.nl:8000
+<retriever_url>

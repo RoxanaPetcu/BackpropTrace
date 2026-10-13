@@ -129,13 +129,36 @@ class SpanwiseLMRewardManager():
                  tokenizer,
                  step_judge,
                  num_examine=0,
-                 structure_token_reward=0.02,
-                 valid_format_bonus=0.05) -> None:
+                 structure_token_reward=0.2,
+                 valid_format_bonus=0.2,
+                 no_answer_penalty=-0.5,
+                 no_think_penalty=-0.3,
+                 pre_warmup_steps=0,
+                 format_warmup_steps=0,
+                 phase_steps=50,
+                 phase_decline_patience=3,
+                 phase_decline_min_delta=0.0) -> None:
         self.tokenizer = tokenizer
         self.step_judge = step_judge
         self.num_examine = num_examine
         self.structure_token_reward = structure_token_reward
         self.valid_format_bonus = valid_format_bonus
+        self.no_answer_penalty = no_answer_penalty
+        self.no_think_penalty = no_think_penalty
+        self.pre_warmup_steps = int(pre_warmup_steps)
+        self.format_warmup_steps = int(format_warmup_steps)
+        self.phase_steps = int(phase_steps)
+        self.phase_decline_patience = int(phase_decline_patience)
+        self.phase_decline_min_delta = float(phase_decline_min_delta)
+        # Dynamic phase state (post-prewarmup): 1=think, 2=search, 3=EM
+        self.current_phase = 1
+        self._prev_think_mean = None
+        self._prev_search_mean = None
+        self._think_decline_streak = 0
+        self._search_decline_streak = 0
+        self._dynamic_phase_enabled = self.phase_steps > 0
+        # Baseline Search-R1 reward behavior used during pre-warmup.
+        self._baseline_reward_manager = RewardManager(tokenizer=tokenizer, num_examine=0, use_answerability=True)
 
     @staticmethod
     def _char_span_to_token_indices(offsets, char_start, char_end, token_cap):
@@ -180,11 +203,101 @@ class SpanwiseLMRewardManager():
                 tagged.append((tok_idx, type_id))
         return tagged
 
+    def _compute_answer_metrics(self, data: DataProto, device: torch.device):
+        """Compute per-sample EM and strict has-answer flags for logging."""
+        answer_em = []
+        has_answer_flags = []
+
+        for i in range(len(data)):
+            data_item = data[i]
+
+            prompt_ids = data_item.batch['prompts']
+            prompt_length = prompt_ids.shape[-1]
+            valid_prompt_length = int(data_item.batch['attention_mask'][:prompt_length].sum())
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = data_item.batch['responses']
+            valid_response_length = int(data_item.batch['attention_mask'][prompt_length:].sum())
+            valid_response_ids = response_ids[:valid_response_length]
+
+            sequence_ids = torch.cat((valid_prompt_ids, valid_response_ids))
+            sequence_str = self.tokenizer.decode(sequence_ids)
+            response_str = self.tokenizer.decode(valid_response_ids)
+
+            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+            answer_reward = qa_em.compute_score_em(
+                solution_str=sequence_str,
+                ground_truth=ground_truth,
+                add_format=False,
+            )
+            answer_em.append(float(answer_reward))
+
+            spans_local = qa_em.parse_reasoning_trace_spans(response_str)
+            if not spans_local:
+                has_answer_flags.append(0.0)
+                continue
+
+            last_type, last_text, _last_start, last_end = spans_local[-1]
+            trailing_text = response_str[last_end:].strip()
+            is_nonempty_answer = (last_type == 'answer') and (len(last_text.strip()) > 0)
+            has_answer_flags.append(1.0 if is_nonempty_answer and trailing_text == '' else 0.0)
+
+        answer_em_avg = torch.tensor(answer_em, dtype=torch.float32, device=device)
+        has_answer_per_sample = torch.tensor(has_answer_flags, dtype=torch.float32, device=device)
+        return answer_em_avg, has_answer_per_sample
+
     def __call__(self, data: DataProto):
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         span_type_mask = torch.zeros_like(data.batch['responses'], dtype=torch.long)
+        phase_loss_mask = torch.ones_like(data.batch['responses'], dtype=torch.long)
         judge_think_avg = torch.zeros((len(data),), dtype=torch.float32, device=reward_tensor.device)
         judge_search_avg = torch.zeros((len(data),), dtype=torch.float32, device=reward_tensor.device)
+        global_steps = int(data.meta_info.get('global_steps', 0))
+        in_pre_warmup = (self.pre_warmup_steps > 0) and (global_steps <= self.pre_warmup_steps)
+        in_format_warmup = global_steps < self.format_warmup_steps
+        active_phase = self.current_phase if self._dynamic_phase_enabled else 0
+        # active_phase = self.current_phase if self._dynamic_phase_enabled else 3
+        current_phase_batch = torch.full((len(data),), active_phase, dtype=torch.long, device=reward_tensor.device)
+
+        if in_pre_warmup:
+            # During pre-warmup, mimic the baseline GRPO reward (single EM-style
+            # outcome reward on terminal token). Advantage routing is switched to
+            # standard GRPO in ray_trainer using the same step gate.
+            reward_tensor = self._baseline_reward_manager(data)
+            data.batch['span_type_mask'] = span_type_mask
+            data.batch['phase_loss_mask'] = phase_loss_mask
+            data.batch['judge_think_avg'] = judge_think_avg
+            data.batch['judge_search_avg'] = judge_search_avg
+            answer_em_avg, has_answer_per_sample = self._compute_answer_metrics(data, reward_tensor.device)
+            data.batch['answer_em_avg'] = answer_em_avg
+            data.batch['has_answer_per_sample'] = has_answer_per_sample
+            # Phase id -1 denotes pre-warmup baseline stage.
+            data.batch['current_phase'] = torch.full((len(data),), -1, dtype=torch.long, device=reward_tensor.device)
+            # Reset dynamic phase state so transitions start clean after pre-warmup.
+            self.current_phase = 1
+            self._prev_think_mean = None
+            self._prev_search_mean = None
+            self._think_decline_streak = 0
+            self._search_decline_streak = 0
+            return reward_tensor
+
+        # Phase 3: identical to pre-warmup — single terminal-token EM reward,
+        # loss propagated to all non-information tokens via state_masking.
+        if active_phase == 3:
+            reward_tensor = self._baseline_reward_manager(data)
+            data.batch['span_type_mask'] = span_type_mask
+            data.batch['phase_loss_mask'] = phase_loss_mask
+            data.batch['judge_think_avg'] = judge_think_avg
+            data.batch['judge_search_avg'] = judge_search_avg
+            answer_em_avg, has_answer_per_sample = self._compute_answer_metrics(data, reward_tensor.device)
+            data.batch['answer_em_avg'] = answer_em_avg
+            data.batch['has_answer_per_sample'] = has_answer_per_sample
+            data.batch['current_phase'] = torch.full((len(data),), 3, dtype=torch.long, device=reward_tensor.device)
+            return reward_tensor
+
+        phase_think_scores = []
+        phase_search_scores = []
+        phase_answer_scores = []
 
         already_printed = 0
 
@@ -213,6 +326,8 @@ class SpanwiseLMRewardManager():
                 ground_truth=ground_truth,
                 add_format=False,
             )
+            em_success = float(answer_reward) >= 0.999
+            phase_answer_scores.append(float(answer_reward))
 
             try:
                 tokenized_resp = self.tokenizer(
@@ -233,12 +348,14 @@ class SpanwiseLMRewardManager():
                 if span_type == 'think':
                     raw_reward = float(self.step_judge['think_judge'](question, previous_thinks, span_text))
                     think_scores.append(raw_reward)
+                    phase_think_scores.append(raw_reward)
                     type_id = 1
                     previous_thinks.append(span_text)
                     last_think = span_text
                 elif span_type == 'search':
                     raw_reward = float(self.step_judge['search_judge'](last_think, span_text))
                     search_scores.append(raw_reward)
+                    phase_search_scores.append(raw_reward)
                     type_id = 2
                 elif span_type == 'answer':
                     raw_reward = float(answer_reward)
@@ -246,6 +363,26 @@ class SpanwiseLMRewardManager():
                 else:
                     raw_reward = 0.0
                     type_id = 0
+
+                # If EM is correct, propagate reward 1.0 to all learnable spans
+                # (think/search/answer), while keeping information spans masked.
+                if em_success and type_id in (1, 2, 3):
+                    raw_reward = 1.0
+
+                # Mandatory warm-up: optimize formatting first by zeroing span-wise
+                # semantic rewards (think/search/answer). Structure/format bonuses
+                # are still added below.
+                if in_format_warmup and type_id in (1, 2, 3):
+                    raw_reward = 0.0
+
+                # Keep phase masking only for non-EM-success traces.
+                # Phase 1: think judge active; mask search, keep answer (EM).
+                # Phase 2: search judge active; mask think, keep answer (EM).
+                if (not em_success) and self._dynamic_phase_enabled and type_id in (1, 2, 3):
+                    if active_phase == 1 and type_id == 2:
+                        raw_reward = 0.0
+                    elif active_phase == 2 and type_id == 1:
+                        raw_reward = 0.0
 
                 tok_indices = self._char_span_to_token_indices(
                     offsets=offsets,
@@ -275,10 +412,39 @@ class SpanwiseLMRewardManager():
                 learnable_mask = (span_type_mask[i] == 1) | (span_type_mask[i] == 2) | (span_type_mask[i] == 3)
                 reward_tensor[i, learnable_mask] += self.valid_format_bonus
 
+            # Penalize truncated/looping traces that never produced </answer>.
+            # Applies in all phases (warm_up or not): the model must learn to terminate.
+            has_answer = any(span_type == 'answer' for span_type, _, _, _ in spans)
+            if not has_answer:
+                last_valid_tok = valid_response_length - 1
+                reward_tensor[i, last_valid_tok] += self.no_answer_penalty
+
+            # Penalize traces that skip <think> tags entirely. The model must not
+            # bypass the think judge by putting reasoning as free text outside tags.
+            has_think = any(span_type == 'think' for span_type, _, _, _ in spans)
+            if not has_think and not in_format_warmup:
+                last_valid_tok = valid_response_length - 1
+                reward_tensor[i, last_valid_tok] += self.no_think_penalty
+
             if think_scores:
                 judge_think_avg[i] = float(np.mean(think_scores))
             if search_scores:
                 judge_search_avg[i] = float(np.mean(search_scores))
+
+            # Apply phase-specific token update masks so only desired spans receive
+            # policy/KL/entropy updates in warmup phases.
+            if self._dynamic_phase_enabled and active_phase in (1, 2):
+                if active_phase == 1:
+                    allowed_mask = (span_type_mask[i] == 1) | (span_type_mask[i] == 3)
+                else:
+                    allowed_mask = (span_type_mask[i] == 2) | (span_type_mask[i] == 3)
+
+                sample_phase_mask = torch.zeros_like(span_type_mask[i], dtype=torch.long)
+                sample_phase_mask[:valid_response_length] = allowed_mask[:valid_response_length].long()
+                if sample_phase_mask[:valid_response_length].sum() == 0 and valid_response_length > 0:
+                    # Fallback: always keep at least one token trainable.
+                    sample_phase_mask[valid_response_length - 1] = 1
+                phase_loss_mask[i] = sample_phase_mask
 
             if already_printed < self.num_examine:
                 already_printed += 1
@@ -288,9 +454,73 @@ class SpanwiseLMRewardManager():
                 print(f"[{sample_id}] {sequence_str}")
                 print(f"[{sample_id}] ========== END TRACE ==========")
 
+        n = len(data)
+        answer_em_avg = torch.tensor(
+            [phase_answer_scores[i] if i < len(phase_answer_scores) else 0.0 for i in range(n)],
+            dtype=torch.float32, device=reward_tensor.device,
+        )
+        # Strict has_answer_ratio:
+        # count as 1 only if the final meaningful span is a non-empty <answer>
+        # and there is no non-whitespace trailing text after </answer>.
+        has_answer_flags = []
+        for i in range(len(data)):
+            data_item = data[i]
+            prompt_ids = data_item.batch['prompts']
+            prompt_length = prompt_ids.shape[-1]
+            response_ids = data_item.batch['responses']
+            valid_response_length = int(data_item.batch['attention_mask'][prompt_length:].sum())
+            valid_response_ids = response_ids[:valid_response_length]
+            response_str = self.tokenizer.decode(valid_response_ids)
+            spans_local = qa_em.parse_reasoning_trace_spans(response_str)
+
+            if not spans_local:
+                has_answer_flags.append(0.0)
+                continue
+
+            last_type, last_text, _last_start, last_end = spans_local[-1]
+            trailing_text = response_str[last_end:].strip()
+            is_nonempty_answer = (last_type == 'answer') and (len(last_text.strip()) > 0)
+            has_answer_flags.append(1.0 if is_nonempty_answer and trailing_text == '' else 0.0)
+
+        has_answer_per_sample = torch.tensor(
+            has_answer_flags,
+            dtype=torch.float32,
+            device=reward_tensor.device,
+        )
+
+        # Dynamic phase transitions based on consecutive declines.
+        if self._dynamic_phase_enabled:
+            if self.current_phase == 1 and phase_think_scores:
+                think_mean = float(np.mean(phase_think_scores))
+                if self._prev_think_mean is not None and think_mean < (self._prev_think_mean - self.phase_decline_min_delta):
+                    self._think_decline_streak += 1
+                else:
+                    self._think_decline_streak = 0
+                self._prev_think_mean = think_mean
+                if self._think_decline_streak >= self.phase_decline_patience:
+                    self.current_phase = 2
+                    self._think_decline_streak = 0
+                    self._prev_search_mean = None
+                    self._search_decline_streak = 0
+
+            elif self.current_phase == 2 and phase_search_scores:
+                search_mean = float(np.mean(phase_search_scores))
+                if self._prev_search_mean is not None and search_mean < (self._prev_search_mean - self.phase_decline_min_delta):
+                    self._search_decline_streak += 1
+                else:
+                    self._search_decline_streak = 0
+                self._prev_search_mean = search_mean
+                if self._search_decline_streak >= self.phase_decline_patience:
+                    self.current_phase = 3
+                    self._search_decline_streak = 0
+
         data.batch['span_type_mask'] = span_type_mask
+        data.batch['phase_loss_mask'] = phase_loss_mask
         data.batch['judge_think_avg'] = judge_think_avg
         data.batch['judge_search_avg'] = judge_search_avg
+        data.batch['answer_em_avg'] = answer_em_avg
+        data.batch['has_answer_per_sample'] = has_answer_per_sample
+        data.batch['current_phase'] = current_phase_batch
         return reward_tensor
 
 
@@ -395,11 +625,24 @@ def main_task(config):
 
     if config.algorithm.adv_estimator == 'grpo_spanwise_lm':
         step_judge = qa_em.init_llm_step_judge(
-            model_name="Qwen/Qwen2.5-0.5B-Instruct",
-            device="cpu",
-            max_new_tokens=4,
+            model_name="all-MiniLM-L6-v2",
+            think_judge_mode=config.algorithm.get('think_judge_mode', 'nli'),
+            reasoning_prompt_model=config.algorithm.get('reasoning_prompt_model', 'Qwen/Qwen2.5-0.5B-Instruct'),
         )
-        reward_fn = SpanwiseLMRewardManager(tokenizer=tokenizer, step_judge=step_judge, num_examine=0)
+        reward_fn = SpanwiseLMRewardManager(
+            tokenizer=tokenizer,
+            step_judge=step_judge,
+            num_examine=0,
+            structure_token_reward=float(config.algorithm.get('structure_token_reward', 0.2)),
+            valid_format_bonus=float(config.algorithm.get('valid_format_bonus', 0.2)),
+            no_answer_penalty=float(config.algorithm.get('no_answer_penalty', -0.5)),
+            no_think_penalty=float(config.algorithm.get('no_think_penalty', -0.3)),
+            pre_warmup_steps=int(config.algorithm.get('pre_warmup_steps', 0)),
+            format_warmup_steps=int(config.algorithm.get('format_warmup_steps', 0)),
+            phase_steps=int(config.algorithm.get('phase_steps', 50)),
+            phase_decline_patience=int(config.algorithm.get('phase_decline_patience', 3)),
+            phase_decline_min_delta=float(config.algorithm.get('phase_decline_min_delta', 0.0)),
+        )
     else:
         reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, use_answerability=True)
 
